@@ -1,16 +1,4 @@
 #!/usr/bin/env python3
-"""
-vrchat-auth-cli
----------------
-Interactive CLI to log into the VRChat API and retrieve your auth cookie
-and 2FA token.  Supports TOTP, email OTP, and recovery codes.
-
-Usage:
-    python3 vrchat_auth.py                         # print tokens to stdout
-    python3 vrchat_auth.py --write-env .env        # write / update a .env file
-    python3 vrchat_auth.py --help
-"""
-
 import argparse
 import base64
 import getpass
@@ -23,19 +11,17 @@ from pathlib import Path
 import requests
 
 VRCHAT_API = "https://api.vrchat.cloud/api/1"
-USER_AGENT = "vrchat-auth-cli/1.0 (github.com/realPrix/vrchat-auth-cli)"
+USER_AGENT = "Mozilla/5.0 vrchat-auth-cli"
 
 
-# ── helpers ────────────────────────────────────────────────────────────────────
-
-def _headers(cookies: dict | None = None) -> dict:
+def _headers(cookies=None):
     h = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     if cookies:
         h["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
     return h
 
 
-def _cookie_from_response(resp: requests.Response, name: str) -> str | None:
+def _get_cookie(resp, name):
     val = resp.cookies.get(name)
     if val:
         return val
@@ -44,7 +30,7 @@ def _cookie_from_response(resp: requests.Response, name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _decode_jwt_exp(token: str) -> datetime | None:
+def _jwt_expiry(token):
     try:
         payload_b64 = token.split(".")[1]
         payload_b64 += "=" * (4 - len(payload_b64) % 4)
@@ -54,10 +40,7 @@ def _decode_jwt_exp(token: str) -> datetime | None:
         return None
 
 
-# ── VRChat auth flow ────────────────────────────────────────────────────────────
-
-def step1_login(username: str, password: str) -> tuple[str | None, dict | None]:
-    """Basic-auth login. Returns (auth_cookie, response_body)."""
+def do_login(username, password):
     creds = base64.b64encode(f"{username}:{password}".encode()).decode()
     try:
         resp = requests.get(
@@ -65,26 +48,25 @@ def step1_login(username: str, password: str) -> tuple[str | None, dict | None]:
             headers={**_headers(), "Authorization": f"Basic {creds}"},
             timeout=15,
         )
-    except requests.RequestException as exc:
-        print(f"  Network error: {exc}", file=sys.stderr)
+    except requests.RequestException as e:
+        print(f"network error: {e}", file=sys.stderr)
         return None, None
 
     if resp.status_code == 401:
-        print("  Wrong username or password.", file=sys.stderr)
+        print("wrong username or password", file=sys.stderr)
         return None, None
     if resp.status_code != 200:
-        print(f"  Unexpected response {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+        print(f"got {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
         return None, None
 
-    auth = _cookie_from_response(resp, "auth")
+    auth = _get_cookie(resp, "auth")
     if not auth:
-        print("  No auth cookie in response.", file=sys.stderr)
+        print("no auth cookie in response", file=sys.stderr)
         return None, None
     return auth, resp.json()
 
 
-def step2_verify_2fa(auth_cookie: str, code: str, method: str) -> str | None:
-    """Verify MFA code. Returns twoFactorAuth cookie on success."""
+def verify_2fa(auth_cookie, code, method):
     resp = requests.post(
         f"{VRCHAT_API}/auth/twofactorauth/{method}/verify",
         headers=_headers({"auth": auth_cookie}),
@@ -94,57 +76,50 @@ def step2_verify_2fa(auth_cookie: str, code: str, method: str) -> str | None:
     if resp.status_code != 200:
         body = resp.json() if resp.content else {}
         msg = body.get("error", {}).get("message", resp.text[:200])
-        print(f"  2FA failed ({resp.status_code}): {msg}", file=sys.stderr)
+        print(f"2FA failed: {msg}", file=sys.stderr)
         return None
-    tfa = _cookie_from_response(resp, "twoFactorAuth")
-    return tfa or ""
+    return _get_cookie(resp, "twoFactorAuth") or ""
 
 
-def interactive_login() -> tuple[str | None, str | None]:
-    """Walk the user through login + 2FA. Returns (auth_cookie, twofa_cookie)."""
+def login():
     print()
-    username = input("  VRChat username or email: ").strip()
-    password = getpass.getpass("  Password: ")
+    username = input("username or email: ").strip()
+    password = getpass.getpass("password: ")
 
-    print("  Logging in...")
-    auth, data = step1_login(username, password)
+    print("logging in...")
+    auth, data = do_login(username, password)
     if not auth:
         return None, None
 
     methods = data.get("requiresTwoFactorAuth", [])
     if not methods:
-        print("  Logged in (no 2FA on this account).")
+        print("done (no 2FA)")
         return auth, None
 
-    print(f"  2FA required. Available methods: {', '.join(methods)}")
-
     if "totp" in methods:
-        method, prompt = "totp", "  Authenticator app code (6 digits): "
+        method, prompt = "totp", "authenticator code: "
     elif "emailotp" in methods:
-        method, prompt = "emailotp", "  Email OTP (check your inbox): "
+        method, prompt = "emailotp", "email OTP: "
     elif "otp" in methods:
-        method, prompt = "otp", "  Recovery code: "
+        method, prompt = "otp", "recovery code: "
     else:
-        print(f"  Unknown 2FA method(s): {methods}", file=sys.stderr)
+        print(f"unknown 2FA method: {methods}", file=sys.stderr)
         return None, None
 
     code = input(prompt).strip()
-    print("  Verifying 2FA...")
-    tfa = step2_verify_2fa(auth, code, method)
+    tfa = verify_2fa(auth, code, method)
     if tfa is None:
         return None, None
 
-    print("  2FA verified.")
+    print("done")
     return auth, tfa
 
 
-# ── .env writer ─────────────────────────────────────────────────────────────────
-
-def write_env(path: str, auth: str, tfa: str | None) -> None:
+def write_env(path, auth, tfa):
     p = Path(path)
     lines = p.read_text().splitlines(keepends=True) if p.exists() else []
 
-    def upsert(key: str, value: str) -> None:
+    def upsert(key, value):
         pattern = re.compile(rf"^{re.escape(key)}\s*=")
         nonlocal lines
         new_lines = []
@@ -164,51 +139,26 @@ def write_env(path: str, auth: str, tfa: str | None) -> None:
         upsert("VRCHAT_TWO_FACTOR_AUTH", tfa)
 
     p.write_text("".join(lines))
-    print(f"  Written to {p}")
+    print(f"written to {p}")
 
 
-# ── output ───────────────────────────────────────────────────────────────────────
-
-def print_results(auth: str, tfa: str | None) -> None:
-    width = 72
-    print()
-    print("=" * width)
-    print("  VRChat credentials")
-    print("=" * width)
-    print(f"\n  VRCHAT_AUTH_COOKIE={auth}")
+def print_results(auth, tfa):
+    print(f"\nVRCHAT_AUTH_COOKIE={auth}")
     if tfa:
-        print(f"\n  VRCHAT_TWO_FACTOR_AUTH={tfa}")
-        exp = _decode_jwt_exp(tfa)
+        print(f"\nVRCHAT_TWO_FACTOR_AUTH={tfa}")
+        exp = _jwt_expiry(tfa)
         if exp:
-            print(f"\n  2FA token expires: {exp.strftime('%Y-%m-%d %H:%M UTC')}  (~30 days)")
-    else:
-        print("\n  (no 2FA token — account has no 2FA)")
-    print()
-    print("=" * width)
+            print(f"\nexpires: {exp.strftime('%Y-%m-%d %H:%M UTC')}")
     print()
 
 
-# ── main ────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="vrchat-auth",
-        description="Retrieve VRChat auth cookies via the official API.",
-    )
-    parser.add_argument(
-        "--write-env",
-        metavar="FILE",
-        help="Write / update VRCHAT_AUTH_COOKIE and VRCHAT_TWO_FACTOR_AUTH in FILE",
-    )
+def main():
+    parser = argparse.ArgumentParser(description="get vrchat auth tokens")
+    parser.add_argument("--write-env", metavar="FILE", help="write tokens into a .env file")
     args = parser.parse_args()
 
-    print("=" * 72)
-    print("  vrchat-auth-cli")
-    print("=" * 72)
-
-    auth, tfa = interactive_login()
+    auth, tfa = login()
     if not auth:
-        print("\nAuthentication failed.", file=sys.stderr)
         sys.exit(1)
 
     print_results(auth, tfa)
